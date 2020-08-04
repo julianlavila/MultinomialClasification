@@ -1,0 +1,223 @@
+---
+title: "MultinomialClasification"
+author: "Julian Avila-Jimenez"
+date: "3/8/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE,echo = TRUE, warning = FALSE,
+                      message = FALSE, dpi= 180, fig.width = 8,
+                      fig.height = 5)
+library(tidyverse)
+```
+
+## Get the data from [Volcano](https://github.com/rfordatascience/tidytuesday/tree/master/data/2020/2020-05-12) data from TidyTuesday 2020-05-12.
+```{r}
+Volcano<- readr::read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-05-12/volcano.csv")
+
+Volcano
+```
+
+## Explore the Volcano dataset.
+```{r}
+Volcano %>% 
+  count(primary_volcano_type, 
+        sort = T) %>% 
+  knitr::kable()
+```
+
+Here we see the different types of volcano classes, maybe we can do a MultiClass Classification (multinomial) to determine the type of volcano.
+
+26 classes is too much for under 1000 registries, so we can reduce the classes to a few less to work.
+
+
+```{r}
+Volcano_df<- Volcano %>% 
+  transmute(volcano_type= case_when(str_detect(primary_volcano_type,
+                                               "Stratovolcano") ~ "Stratovolcano  ",
+                                    str_detect(primary_volcano_type, "Shield") ~ "Shield",
+                                    str_detect(primary_volcano_type, "Volcanic field") ~ "Volcanic field", 
+                                    TRUE ~"Other"),
+            volcano_number, latitude, longitude, 
+            elevation, tectonic_settings, major_rock_1) %>% 
+  mutate_if(is.character, factor)
+```
+
+Let's see the spatial distribution of the volcanoes 
+```{r}
+world<- map_data("world")
+
+ggplot()+
+  geom_map(data= world, map= world,
+           aes(long, lat, map_id = region), 
+               color= "white", fill= "gray50", alpha= 0.2)+
+  geom_point(data= Volcano_df,
+             aes(longitude, latitude, color= volcano_type), 
+             alpha= 0.8)+ 
+  scale_color_brewer(palette="Dark2")+
+  labs(title= "Volcanoes geographic distribution\nby Volcano type")+
+  theme_bw()+
+  theme(legend.title = element_blank())
+```
+
+## Modeling Proces.
+There is no sufficient data to split into train and test, so we can do a bootstrap
+
+```{r}
+library(tidymodels)
+
+Volcano_boot<- bootstraps(Volcano_df)
+Volcano_boot
+```
+
+```{r}
+Volcano_df %>% 
+  count(volcano_type)
+```
+
+The number of each type of volcanoes is too unbalanced so we have to deal with it with a SMOTE algorithm of the [themis](https://github.com/tidymodels/themis) library.
+
+To do this first we have create a Dummy variable to transform the factors to numeric and center scale the numeric variables. 
+```{r}
+Volcano_df %>% 
+  count(tectonic_settings) #too much categories!
+
+Volcano_df %>% 
+  count(tectonic_settings) #Same, too much categories!
+```
+
+### Preprocesing.
+Let's make the recipe!
+```{r}
+library(themis)
+
+Volcano_rec<-recipe(volcano_type ~ ., data= Volcano_df ) %>% #Predict Volcano type with everything else
+  update_role(volcano_number, new_role = "Id") %>% 
+  step_other(tectonic_settings) %>%  #collapses the most infrequent levels to "Other"
+  step_other(major_rock_1) %>% #same as before
+  step_dummy(tectonic_settings, major_rock_1) %>%  #creates Dummy variables
+  step_zv(all_predictors()) %>% #remove variables with zero variance
+  step_normalize(all_predictors()) %>% #centerscale all predictors
+  step_smote(volcano_type) #generate new examples of the minority class using nearest neighbors of these cases
+  
+Volcano_prep<- prep(Volcano_rec) #train the recipe
+Volcano_prep
+```
+Notice how many new info we have, the new rows are because the oversampling and columns by the new Dummy variables
+```{r}
+
+juice(Volcano_prep)
+juice(Volcano_prep) %>% 
+  count(volcano_type) %>% #same number of observations by the oversampling of step_ smote()
+  knitr::kable()
+```
+
+### Build a model.
+First let's try a Random forest
+
+Advantages:
+- Is versatile, can be used for prediction and classification problems 
+- No need to fine tuning parameters with a significant number of trees
+
+we are going to fit a model using the advantages of [TidyModels](https://www.tidymodels.org/), using the [ranger](https://rdrr.io/cran/ranger/man/ranger.html) engine, a fastest implementation of Random Forest algorithm, and setting a workflow 
+
+```{r}
+rf_spec<-
+  rand_forest(trees=1000) %>%
+  set_mode("classification") %>% 
+  set_engine("ranger")
+
+Volcano_wf<- 
+  workflow() %>% 
+  add_recipe(Volcano_rec) %>% 
+  add_model(rf_spec)
+
+Volcano_wf
+```
+
+Results
+```{r}
+Volcano_res<-
+  fit_resamples(
+  Volcano_wf,
+  resamples= Volcano_boot, #we have 25 resamples 
+  control= control_resamples(save_pred = TRUE)
+)
+
+Volcano_res
+```
+
+## Explore the results
+Look that the estimators are adjusted to a classification problem 
+```{r}
+Volcano_res %>% 
+  collect_metrics() %>% 
+  knitr::kable()
+
+```
+The classification don't perform very well, just above the random probabilities but maybe influenced by the small dataset...
+
+```{r}
+Volcano_res %>% 
+  collect_predictions() %>% 
+  conf_mat(volcano_type, .pred_class)
+```
+
+Positive predictive value [Wikipedia](https://en.wikipedia.org/wiki/Positive_and_negative_predictive_values)
+```{r}
+Volcano_res %>% 
+  collect_predictions() %>% 
+  ppv(volcano_type, .pred_class) %>% 
+  knitr::kable()
+
+```
+
+### Now let's explore the variable importance 
+
+```{r}
+library(vip)
+rf_spec %>% 
+  set_engine("ranger", 
+             importance= "permutation") %>% 
+  fit(
+    volcano_type ~ ., 
+    data= juice(Volcano_prep) %>%
+    select(-volcano_number) %>% 
+    janitor:: clean_names() 
+  ) %>% 
+  vip(geom="col",fill="cyan4")
+
+```
+it's clear that the longitude and latitude are the most important variables of the classification process 
+
+
+## Now a final map
+
+```{r}
+Volcano_predictions<- 
+  Volcano_res %>% 
+  collect_predictions() %>% 
+  mutate(Correct = volcano_type == .pred_class) %>% 
+  left_join(Volcano_df %>% 
+              mutate(.row= row_number()))
+Volcano_predictions
+```
+
+```{r}
+ggplot()+
+  geom_map(data=world,map=world,
+           aes(long, lat, map_id= region),
+           color="white", fill="gray50", alpha=0.2)+
+  stat_summary_hex(data= Volcano_predictions, 
+                   aes(longitude, latitude, z= as.integer(Correct)),
+                   fun= "mean", alpha= 0.7, bins= 60)+
+  scale_fill_gradient(high= "cyan3", labels= scales::percent)+
+  theme_bw()+
+  labs(title= "Volcanoes geographic distribution",
+       subtitle= "classification performance",
+       fill=" Percent classified \ncorrectly")
+```
+

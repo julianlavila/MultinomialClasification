@@ -1,5 +1,6 @@
 ---
-title: "README"
+title: "Multinomial Classification of the Volcano dataset"
+subtitle: "Data from TidyTuesday 2020-05-12"
 output: github_document
 ---
 

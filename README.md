@@ -1,4 +1,4 @@
-README
+Multinomial Classification of the Volcano dataset
 ================
 
 ## Get the data from [Volcano](https://github.com/rfordatascience/tidytuesday/tree/master/data/2020/2020-05-12) data from TidyTuesday 2020-05-12.
